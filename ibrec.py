@@ -20,7 +20,7 @@ class SequenceDataset(Dataset):
     def __getitem__(self, idx):
         seq = self.sequences[idx]
         tgt = self.targets[idx]
-        # pad or truncate
+        # pad or truncate to max_seq_len
         if len(seq) < self.max_seq_len:
             padded = [self.pad_item] * (self.max_seq_len - len(seq)) + seq
         else:
@@ -30,7 +30,7 @@ class SequenceDataset(Dataset):
 # ===================== Model Definition =====================
 class IBSelectorModel(nn.Module):
     def __init__(self, num_items, embed_dim=128, max_seq_len=50,
-                 nhead=2, num_layers=2, hidden_dim=256,
+                 nhead=4, num_layers=2, hidden_dim=256,
                  k=5, beta=0.1, tau=0.5):
         super().__init__()
         self.num_items = num_items
@@ -91,32 +91,31 @@ def ndcg_at_k(preds, target, k):
     dcg = (hits / torch.log2(ranks+1)).sum().item()
     return dcg
 
-# ===================== Main Training & Evaluation =====================
+# ===================== Main Training & Leave-One-Out Evaluation =====================
 if __name__ == '__main__':
     # 1. Load data
     df = pd.read_csv('data/moviestv/processed_interactions.csv')  # columns: user_id,item_id,rating,timestamp
-    # ignore rating
+    df = df.sort_values(['user_id', 'timestamp'])
     # map item ids to continuous indices
     item2idx = {item: i+1 for i, item in enumerate(df['item_id'].unique())}
     df['item_idx'] = df['item_id'].map(item2idx)
     num_items = len(item2idx)
 
-    # 2. Prepare train/val/test via leave-one-out + validation
-    df = df.sort_values(['user_id', 'timestamp'])
+    # 2. Prepare leave-one-out splits
     train_seqs, train_tgts = [], []
-    val_seqs, val_tgts = [], []
-    test_seqs, test_tgts = [], []
+    val_seqs, val_tgts     = [], []
+    test_seqs, test_tgts   = [], []
     for _, group in df.groupby('user_id'):
         items = group['item_idx'].tolist()
         if len(items) < 3:
-            continue  # need at least one train, one val, one test
+            continue  # need at least train, val, test
         # test: last
         test_seqs.append(items[:-1])
         test_tgts.append(items[-1])
         # val: second last
         val_seqs.append(items[:-2])
         val_tgts.append(items[-2])
-        # train: sliding window on items[0:-2]
+        # train: sliding window on all except last two
         for i in range(1, len(items)-2):
             train_seqs.append(items[:i])
             train_tgts.append(items[i])
@@ -124,11 +123,11 @@ if __name__ == '__main__':
     # 3. DataLoader
     max_seq_len = 50
     train_ds = SequenceDataset(train_seqs, train_tgts, max_seq_len)
-    val_ds   = SequenceDataset(val_seqs, val_tgts, max_seq_len)
-    test_ds  = SequenceDataset(test_seqs, test_tgts, max_seq_len)
+    val_ds   = SequenceDataset(val_seqs,   val_tgts,   max_seq_len)
+    test_ds  = SequenceDataset(test_seqs,  test_tgts,  max_seq_len)
     train_loader = DataLoader(train_ds, batch_size=512, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=512)
-    test_loader  = DataLoader(test_ds, batch_size=512)
+    val_loader   = DataLoader(val_ds,   batch_size=512)
+    test_loader  = DataLoader(test_ds,  batch_size=512)
 
     # 4. Model & Optimizer
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -136,7 +135,7 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # 5. Training Loop
-    epochs = 20
+    epochs = 10
     for epoch in range(1, epochs+1):
         model.train()
         total_loss = 0
@@ -153,8 +152,8 @@ if __name__ == '__main__':
 
         # 6. Validation
         model.eval()
-        hr1, hr5, hr10 = 0, 0, 0
-        ndcg1, ndcg5, ndcg10 = 0, 0, 0
+        hr1 = hr5 = hr10 = 0
+        ndcg1 = ndcg5 = ndcg10 = 0
         with torch.no_grad():
             for seq_batch, tgt_batch in val_loader:
                 seq_batch = seq_batch.to(device)
@@ -173,8 +172,8 @@ if __name__ == '__main__':
 
     # 7. Final Test Evaluation
     model.eval()
-    hr1, hr5, hr10 = 0, 0, 0
-    ndcg1, ndcg5, ndcg10 = 0, 0, 0
+    hr1 = hr5 = hr10 = 0
+    ndcg1 = ndcg5 = ndcg10 = 0
     with torch.no_grad():
         for seq_batch, tgt_batch in test_loader:
             seq_batch = seq_batch.to(device)
